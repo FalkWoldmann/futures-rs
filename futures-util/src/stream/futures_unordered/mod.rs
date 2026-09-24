@@ -412,15 +412,22 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
     type Item = Fut::Output;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let len = self.len();
+        // `head_all` can be accessed directly and we don't need to spin on
+        // `Task::next_all` since we have exclusive access to the set.
+        let len = {
+            let head = *self.head_all.get_mut();
+            if head.is_null() { 0 } else { unsafe { *(*head).len_all.get() } }
+        };
 
         // Keep track of how many child futures we have polled,
         // in case we want to forcibly yield.
         let mut polled = 0;
         let mut yielded = 0;
 
-        // Ensure `parent` is correctly set.
-        self.ready_to_run_queue.waker.register(cx.waker());
+        // Whether `parent` has been set to the current waker. It only needs to
+        // be set before returning `Pending` without waking the current task,
+        // which is when the ready to run queue is empty.
+        let mut registered = false;
 
         loop {
             // Safety: &mut self guarantees the mutual exclusion `dequeue`
@@ -432,6 +439,13 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
                         // have yielded a `None`
                         *self.is_terminated.get_mut() = true;
                         return Poll::Ready(None);
+                    } else if !registered {
+                        // Ensure `parent` is correctly set, then check the
+                        // queue again, as a task could have been enqueued
+                        // after the previous `dequeue` but before `register`.
+                        self.ready_to_run_queue.waker.register(cx.waker());
+                        registered = true;
+                        continue;
                     } else {
                         return Poll::Pending;
                     }
@@ -478,8 +492,10 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
                 }
             };
 
-            // Safety: `task` is a valid pointer
-            let task = unsafe { self.unlink(task) };
+            // Safety: `task` is a valid pointer. The list of all futures owns
+            // a reference count of the task while it is linked, so we can
+            // borrow the `Arc` without touching the reference count.
+            let task = mem::ManuallyDrop::new(unsafe { Arc::from_raw(task) });
 
             // Unset queued flag: This must be done before polling to ensure
             // that the future's task gets rescheduled if it sends a wake-up
@@ -490,31 +506,31 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
             // We're going to need to be very careful if the `poll`
             // method below panics. We need to (a) not leak memory and
             // (b) ensure that we still don't have any use-after-frees. To
-            // manage this we do a few things:
+            // manage this a "bomb" is created which if dropped abnormally will
+            // unlink the task and call `release_task`. That way we'll be sure
+            // the memory management of the `task` is managed correctly. In
+            // particular `release_task` will drop the future. This ensures
+            // that it is dropped on this thread and not accidentally on a
+            // different thread (bad).
             //
-            // * A "bomb" is created which if dropped abnormally will call
-            //   `release_task`. That way we'll be sure the memory management
-            //   of the `task` is managed correctly. In particular
-            //   `release_task` will drop the future. This ensures that it is
-            //   dropped on this thread and not accidentally on a different
-            //   thread (bad).
-            // * We unlink the task from our internal queue to preemptively
-            //   assume it'll panic, in which case we'll want to discard it
-            //   regardless.
+            // The task stays linked into the list of all futures while it is
+            // being polled, so the common case of a future returning `Pending`
+            // doesn't need to unlink and relink it. The bomb is also used to
+            // release the task once its future has completed.
             struct Bomb<'a, Fut> {
                 queue: &'a mut FuturesUnordered<Fut>,
-                task: Option<Arc<Task<Fut>>>,
+                task: *const Task<Fut>,
             }
 
             impl<Fut> Drop for Bomb<'_, Fut> {
                 fn drop(&mut self) {
-                    if let Some(task) = self.task.take() {
-                        self.queue.release_task(task);
-                    }
+                    // Safety: `task` is a valid pointer to a linked task
+                    let task = unsafe { self.queue.unlink(self.task) };
+                    self.queue.release_task(task);
                 }
             }
 
-            let mut bomb = Bomb { task: Some(task), queue: &mut *self };
+            let bomb = Bomb { task: Arc::as_ptr(&task), queue: &mut *self };
 
             // Poll the underlying future with the appropriate waker
             // implementation. This is where a large bit of the unsafety
@@ -528,12 +544,11 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
             // the internal allocation, appropriately accessing fields and
             // deallocating the task if need be.
             let res = {
-                let task = bomb.task.as_ref().unwrap();
                 // We are only interested in whether the future is awoken before it
                 // finishes polling, so reset the flag here.
                 task.woken.store(false, Relaxed);
                 // SAFETY: see the comments of Bomb and this block.
-                let waker = unsafe { Task::waker_ref(task) };
+                let waker = unsafe { Task::waker_ref(&task) };
                 let mut cx = Context::from_waker(&waker);
 
                 // Safety: We won't move the future ever again
@@ -545,11 +560,12 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
 
             match res {
                 Poll::Pending => {
-                    let task = bomb.task.take().unwrap();
+                    // The task stays linked, so defuse the bomb.
+                    mem::forget(bomb);
+
                     // If the future was awoken during polling, we assume
                     // the future wanted to explicitly yield.
                     yielded += task.woken.load(Relaxed) as usize;
-                    bomb.queue.link(task);
 
                     // If a future yields, we respect it and yield here.
                     // If all futures have been polled, we also yield here to
@@ -562,7 +578,11 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
                     }
                     continue;
                 }
-                Poll::Ready(output) => return Poll::Ready(Some(output)),
+                Poll::Ready(output) => {
+                    // Unlink and release the completed task.
+                    drop(bomb);
+                    return Poll::Ready(Some(output));
+                }
             }
         }
     }

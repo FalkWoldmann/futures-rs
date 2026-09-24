@@ -533,3 +533,27 @@ fn cloned_child_waker_preserves_identity() {
         block_on_stream(FuturesUnordered::from_iter([CheckWakerClone])).collect::<Vec<_>>();
     assert_eq!(output, [()]);
 }
+
+#[test]
+fn panic_on_poll_releases_task() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let (tx, rx) = oneshot::channel::<i32>();
+    let mut stream = FuturesUnordered::new();
+    stream.push(future::lazy(|_| panic!("boom")).boxed());
+    stream.push(rx.map(Result::unwrap).boxed());
+    stream.push(future::pending().boxed());
+    assert_eq!(stream.len(), 3);
+
+    let mut cx = noop_context();
+    let res = catch_unwind(AssertUnwindSafe(|| stream.poll_next_unpin(&mut cx)));
+    assert!(res.is_err());
+    // The panicking future is removed from the set, the others are kept.
+    assert_eq!(stream.len(), 2);
+    assert_eq!(stream.iter_mut().count(), 2);
+
+    tx.send(7).unwrap();
+    assert_eq!(block_on(stream.next()), Some(7));
+    assert_eq!(stream.len(), 1);
+    assert_stream_pending!(stream);
+}
