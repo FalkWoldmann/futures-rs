@@ -61,7 +61,7 @@ pub(super) fn read_to_end_internal<R: AsyncRead + ?Sized>(
             g.buf.reserve(32);
             let spare_capacity = g.buf.capacity() - g.buf.len();
             // FIXME: switch to `Vec::resize` once rust-lang/rust#120050 is fixed
-            g.buf.extend(iter::repeat(0).take(spare_capacity));
+            g.buf.extend(iter::repeat_n(0, spare_capacity));
         }
 
         let buf = &mut g.buf[g.len..];

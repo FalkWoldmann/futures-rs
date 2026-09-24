@@ -425,7 +425,7 @@ impl fmt::Display for Canceled {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for Canceled {}
+impl core::error::Error for Canceled {}
 
 impl<T> Receiver<T> {
     /// Gracefully close this receiver, preventing any subsequent attempts to

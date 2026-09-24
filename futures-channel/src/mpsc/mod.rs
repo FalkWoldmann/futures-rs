@@ -204,7 +204,7 @@ impl fmt::Display for SendError {
     }
 }
 
-impl std::error::Error for SendError {}
+impl core::error::Error for SendError {}
 
 impl fmt::Display for RecvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -212,7 +212,7 @@ impl fmt::Display for RecvError {
     }
 }
 
-impl std::error::Error for RecvError {}
+impl core::error::Error for RecvError {}
 
 impl SendError {
     /// Returns `true` if this error is a result of the channel being full.
@@ -254,7 +254,7 @@ impl<T> fmt::Display for TrySendError<T> {
     }
 }
 
-impl<T: core::any::Any> std::error::Error for TrySendError<T> {}
+impl<T: core::any::Any> core::error::Error for TrySendError<T> {}
 
 impl<T> TrySendError<T> {
     /// Returns `true` if this error is a result of the channel being full.
@@ -287,7 +287,7 @@ impl fmt::Display for TryRecvError {
     }
 }
 
-impl std::error::Error for TryRecvError {}
+impl core::error::Error for TryRecvError {}
 
 struct UnboundedInner<T> {
     // Internal channel state. Consists of the number of messages stored in the
