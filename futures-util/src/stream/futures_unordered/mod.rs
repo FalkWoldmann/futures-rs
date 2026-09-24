@@ -73,7 +73,19 @@ pub struct FuturesUnordered<Fut> {
     ready_to_run_queue: Arc<ReadyToRunQueue<Fut>>,
     head_all: AtomicPtr<Task<Fut>>,
     is_terminated: AtomicBool,
+    // Stack of released tasks whose allocations can be reused by `push`, linked
+    // through `Task::next_all`. `Task::len_all` of each task holds the number of
+    // tasks in the stack from it to the bottom.
+    // Safety invariant: every task in the stack was released (its future is
+    // `None`), is not linked into the list of all futures or enqueued in the
+    // ready to run queue, and the stack owns its only reference count, whose
+    // raw pointer (from `Arc::into_raw`) is stored in the stack. Tasks are only
+    // pushed with exclusive access to `self`, and popped by `pop_free_task`.
+    free: AtomicPtr<Task<Fut>>,
 }
+
+/// The maximum number of released tasks kept for reuse by `push`.
+const MAX_FREE_TASKS: usize = 8;
 
 unsafe impl<Fut: Send> Send for FuturesUnordered<Fut> {}
 unsafe impl<Fut: Send + Sync> Sync for FuturesUnordered<Fut> {}
@@ -153,6 +165,7 @@ impl<Fut> FuturesUnordered<Fut> {
             head_all: AtomicPtr::new(ptr::null_mut()),
             ready_to_run_queue,
             is_terminated: AtomicBool::new(false),
+            free: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -178,16 +191,34 @@ impl<Fut> FuturesUnordered<Fut> {
     /// ensure that [`FuturesUnordered::poll_next`](Stream::poll_next) is called
     /// in order to receive wake-up notifications for the given future.
     pub fn push(&self, future: Fut) {
-        let task = Arc::new(Task {
-            future: UnsafeCell::new(Some(future)),
-            next_all: AtomicPtr::new(self.pending_next_all()),
-            prev_all: UnsafeCell::new(ptr::null_mut()),
-            len_all: UnsafeCell::new(0),
-            next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
-            queued: AtomicBool::new(true),
-            ready_to_run_queue: Arc::downgrade(&self.ready_to_run_queue),
-            woken: AtomicBool::new(false),
-        });
+        let task = match self.pop_free_task() {
+            Some(task) => {
+                // SAFETY: `pop_free_task` transferred ownership of the task's
+                // only reference count to us, so no other reference to the task
+                // exists and writing to its `UnsafeCell` fields cannot race.
+                // Its `ready_to_run_queue` already refers to our queue.
+                unsafe {
+                    *task.future.get() = Some(future);
+                    *task.prev_all.get() = ptr::null_mut();
+                    *task.len_all.get() = 0;
+                }
+                task.next_all.store(self.pending_next_all(), Relaxed);
+                task.next_ready_to_run.store(ptr::null_mut(), Relaxed);
+                task.queued.store(true, Relaxed);
+                task.woken.store(false, Relaxed);
+                task
+            }
+            None => Arc::new(Task {
+                future: UnsafeCell::new(Some(future)),
+                next_all: AtomicPtr::new(self.pending_next_all()),
+                prev_all: UnsafeCell::new(ptr::null_mut()),
+                len_all: UnsafeCell::new(0),
+                next_ready_to_run: AtomicPtr::new(ptr::null_mut()),
+                queued: AtomicBool::new(true),
+                ready_to_run_queue: Arc::downgrade(&self.ready_to_run_queue),
+                woken: AtomicBool::new(false),
+            }),
+        };
 
         // Reset the `is_terminated` flag if we've previously marked ourselves
         // as terminated.
@@ -280,26 +311,75 @@ impl<Fut> FuturesUnordered<Fut> {
         // above so all future `enqueue` operations will not actually
         // enqueue the task, so our task will never see the ready to run queue
         // again. The task itself will be deallocated once all reference counts
-        // have been dropped elsewhere by the various wakers that contain it.
+        // have been dropped elsewhere by the various wakers that contain it,
+        // unless it is kept for reuse.
         //
-        // Use ManuallyDrop to transfer the reference count ownership before
-        // dropping the future so unwinding won't release the reference count.
-        let md_slot;
-        let task = if prev {
-            md_slot = mem::ManuallyDrop::new(task);
-            &*md_slot
-        } else {
-            &task
-        };
-
         // Drop the future, even if it hasn't finished yet. This is safe
         // because we're dropping the future on the thread that owns
         // `FuturesUnordered`, which correctly tracks `Fut`'s lifetimes and
-        // such.
-        unsafe {
-            // Set to `None` rather than `take()`ing to prevent moving the
-            // future.
-            *task.future.get() = None;
+        // such. Set to `None` rather than `take()`ing to prevent moving the
+        // future.
+        if prev {
+            // Use ManuallyDrop to transfer the reference count ownership before
+            // dropping the future so unwinding won't release the reference count.
+            let task = mem::ManuallyDrop::new(task);
+            unsafe { *task.future.get() = None };
+        } else {
+            unsafe { *task.future.get() = None };
+            self.push_free_task(task);
+        }
+    }
+
+    /// Keeps a released task for reuse by `push` if nothing else references
+    /// it, and drops it otherwise.
+    fn push_free_task(&mut self, mut task: Arc<Task<Fut>>) {
+        let free = *self.free.get_mut();
+        // SAFETY: tasks in the stack are alive while the stack owns them, and
+        // `&mut self` excludes concurrent pops, so `free` is not modified.
+        let depth = if free.is_null() { 0 } else { unsafe { *(*free).len_all.get() } };
+        // `Arc::get_mut` fails if a waker still holds a reference count. Its
+        // success also synchronizes with the release of all other reference
+        // counts, so their accesses to the task happen before its reuse.
+        if depth < MAX_FREE_TASKS && Arc::get_mut(&mut task).is_some() {
+            debug_assert!(unsafe { (*task.future.get()).is_none() });
+            debug_assert!(task.queued.load(Relaxed));
+            // SAFETY: we own the only reference count of the task.
+            unsafe { *task.len_all.get() = depth + 1 };
+            task.next_all.store(free, Relaxed);
+            *self.free.get_mut() = Arc::into_raw(task).cast_mut();
+        }
+    }
+
+    /// Takes a released task from the stack of free tasks, if there is one.
+    ///
+    /// # Safety-usable invariant
+    ///
+    /// The returned task is not referenced by anything else (its reference count
+    /// is 1 and it is in no list or queue), its future is `None`, and its
+    /// `ready_to_run_queue` refers to `self.ready_to_run_queue`.
+    fn pop_free_task(&self) -> Option<Arc<Task<Fut>>> {
+        let mut head = self.free.load(Acquire);
+        loop {
+            if head.is_null() {
+                return None;
+            }
+            // SAFETY: `head` was in the stack, so it pointed to a live task.
+            // Tasks are only pushed with exclusive access to `self`, which is
+            // not held while `&self` is borrowed here, so the stack only
+            // shrinks and there is no ABA problem: if the compare-exchange
+            // below succeeds, `head` is still the top of the stack. If another
+            // thread popped `head` meanwhile, it now owns the task, but the task
+            // stays allocated at least until `self` is exclusively borrowed
+            // again, and only its atomic `next_all` field is read here.
+            let next = unsafe { (*head).next_all.load(Relaxed) };
+            match self.free.compare_exchange_weak(head, next, Acquire, Acquire) {
+                // SAFETY: the stack owned the only reference count of the task,
+                // as a pointer returned by `Arc::into_raw` (invariant of
+                // `free`), and the successful compare-exchange transferred it to
+                // us.
+                Ok(_) => return Some(unsafe { Arc::from_raw(head) }),
+                Err(actual) => head = actual,
+            }
         }
     }
 
@@ -488,6 +568,7 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
                     unsafe {
                         debug_assert!((*task.prev_all.get()).is_null());
                     }
+                    self.push_free_task(task);
                     continue;
                 }
             };
@@ -629,6 +710,17 @@ impl<Fut> Drop for FuturesUnordered<Fut> {
             guard.0.release_task(task);
         }
         mem::forget(guard); // safe to release strong reference to queue
+
+        // Free the tasks that were kept for reuse.
+        let mut free = *self.free.get_mut();
+        while !free.is_null() {
+            // SAFETY: the stack of free tasks owns the only reference count of
+            // each task in it, as a pointer returned by `Arc::into_raw`
+            // (invariant of `free`), and `&mut self` gives us exclusive access
+            // to the stack, which is not used afterwards.
+            let task = unsafe { Arc::from_raw(free) };
+            free = task.next_all.load(Relaxed);
+        }
 
         // Note that at this point we could still have a bunch of tasks in the
         // ready to run queue. None of those tasks, however, have futures

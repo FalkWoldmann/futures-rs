@@ -557,3 +557,110 @@ fn panic_on_poll_releases_task() {
     assert_eq!(stream.len(), 1);
     assert_stream_pending!(stream);
 }
+
+#[test]
+fn reused_tasks_ignore_old_wakers() {
+    use std::{
+        sync::{Arc, Mutex},
+        task::Waker,
+    };
+
+    // A future that is pending until it has been polled `n` times, counting
+    // its polls and keeping clones of its wakers.
+    struct Counted {
+        n: usize,
+        polls: Arc<AtomicUsize>,
+        wakers: Arc<Mutex<Vec<Waker>>>,
+    }
+    impl Future for Counted {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.n -= 1;
+            if self.n == 0 {
+                return Poll::Ready(());
+            }
+            self.wakers.lock().unwrap().push(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let wakers = Arc::new(Mutex::new(Vec::new()));
+    let mut stream = FuturesUnordered::new();
+    let mut cx = noop_context();
+
+    for _ in 0..4 {
+        // Complete futures whose wakers are kept (so their tasks can't be
+        // reused) and futures without wakers (whose tasks can).
+        for n in [1, 2, 1, 2] {
+            stream.push(Counted { n, polls: polls.clone(), wakers: wakers.clone() });
+        }
+        while let Poll::Ready(Some(())) | Poll::Pending = stream.poll_next_unpin(&mut cx) {
+            for waker in wakers.lock().unwrap().iter() {
+                waker.wake_by_ref();
+            }
+            if stream.is_empty() {
+                break;
+            }
+        }
+        assert!(stream.is_empty());
+
+        // Old wakers must not cause the new futures to be polled.
+        polls.store(0, Ordering::SeqCst);
+        for _ in 0..8 {
+            stream.push(Counted { n: 100, polls: polls.clone(), wakers: Arc::default() });
+        }
+        assert_stream_pending!(stream);
+        assert_eq!(polls.load(Ordering::SeqCst), 8);
+        for waker in wakers.lock().unwrap().drain(..) {
+            waker.wake();
+        }
+        assert_stream_pending!(stream);
+        assert_eq!(polls.load(Ordering::SeqCst), 8);
+        stream.clear();
+    }
+}
+
+#[test]
+fn concurrent_push_reuses_tasks() {
+    let mut stream = FuturesUnordered::new();
+    for round in 0..20 {
+        // Complete some futures so that released tasks are kept for reuse.
+        for i in 0..16 {
+            stream.push(future::ready(i));
+        }
+        assert_eq!(block_on(stream.by_ref().collect::<Vec<_>>()).len(), 16);
+
+        // Push from several threads concurrently, racing to take free tasks.
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let stream = &stream;
+                s.spawn(move || {
+                    for i in 0..8 {
+                        stream.push(future::ready(round * 100 + t * 10 + i));
+                    }
+                });
+            }
+        });
+        assert_eq!(stream.len(), 32);
+        let mut values = block_on(stream.by_ref().collect::<Vec<_>>());
+        values.sort_unstable();
+        let mut expected: Vec<_> =
+            (0..4).flat_map(|t| (0..8).map(move |i| round * 100 + t * 10 + i)).collect();
+        expected.sort_unstable();
+        assert_eq!(values, expected);
+    }
+}
+
+#[test]
+fn drop_with_free_tasks() {
+    let mut stream = FuturesUnordered::new();
+    for i in 0..16 {
+        stream.push(future::ready(i));
+    }
+    assert_eq!(block_on(stream.by_ref().count()), 16);
+    // Tasks kept for reuse are freed with the set.
+    stream.push(future::ready(0));
+    drop(stream);
+}
