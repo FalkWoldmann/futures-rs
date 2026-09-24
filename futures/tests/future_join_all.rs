@@ -1,4 +1,7 @@
-use std::{fmt::Debug, pin::pin};
+use std::{
+    fmt::Debug,
+    pin::{Pin, pin},
+};
 
 use futures::{
     executor::block_on,
@@ -39,4 +42,33 @@ fn join_all_iter_lifetime() {
 #[test]
 fn join_all_from_iter() {
     assert_done(vec![ready(1), ready(2)].into_iter().collect::<JoinAll<_>>(), vec![1, 2])
+}
+
+#[test]
+fn join_all_preserves_order() {
+    use futures::{channel::oneshot, task::Poll};
+    use futures_test::task::noop_context;
+
+    for n in [0, 1, 30, 31, 100] {
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| oneshot::channel()).unzip();
+        let mut fut = join_all(rxs);
+        if n > 0 {
+            assert!(Pin::new(&mut fut).poll(&mut noop_context()).is_pending());
+        }
+        // Complete the futures in reverse order.
+        for (i, tx) in txs.into_iter().enumerate().rev() {
+            tx.send(i).unwrap();
+        }
+        let expected: Vec<_> = (0..n).map(Ok).collect();
+        assert_eq!(Pin::new(&mut fut).poll(&mut noop_context()), Poll::Ready(expected));
+    }
+}
+
+#[test]
+fn join_all_unbounded_size_hint() {
+    for n in [0, 1, 30, 31, 100] {
+        let iter = (0..).take_while(|&i| i < n).map(ready);
+        assert_eq!(iter.size_hint(), (0, None));
+        assert_done(join_all(iter), (0..n).collect::<Vec<_>>());
+    }
 }

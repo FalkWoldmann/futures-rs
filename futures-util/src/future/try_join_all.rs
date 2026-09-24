@@ -11,10 +11,15 @@ use core::{
     task::{Context, Poll},
 };
 
+#[cfg(target_has_atomic = "ptr")]
+use futures_core::ready;
+
+#[cfg(target_has_atomic = "ptr")]
+use super::join_all::Collected;
 use super::{IntoFuture, TryFuture, TryMaybeDone, assert_future, join_all};
 use crate::TryFutureExt;
 #[cfg(target_has_atomic = "ptr")]
-use crate::stream::{FuturesOrdered, TryCollect, TryStreamExt};
+use crate::stream::{FuturesUnordered, StreamExt, futures_ordered::OrderWrapper};
 
 enum FinalState<E = ()> {
     Pending,
@@ -40,7 +45,9 @@ where
     },
     #[cfg(target_has_atomic = "ptr")]
     Big {
-        fut: TryCollect<FuturesOrdered<IntoFuture<F>>, Vec<F::Ok>>,
+        fut: FuturesUnordered<OrderWrapper<IntoFuture<F>>>,
+        // The output of each future, stored at the future's index.
+        outputs: Box<[Option<F::Ok>]>,
     },
 }
 
@@ -57,7 +64,9 @@ where
                 f.debug_struct("TryJoinAll").field("elems", elems).finish()
             }
             #[cfg(target_has_atomic = "ptr")]
-            TryJoinAllKind::Big { ref fut, .. } => fmt::Debug::fmt(fut, f),
+            TryJoinAllKind::Big { ref fut, ref outputs } => {
+                f.debug_struct("TryJoinAll").field("fut", fut).field("outputs", outputs).finish()
+            }
         }
     }
 }
@@ -79,9 +88,10 @@ where
 ///
 /// # See Also
 ///
-/// `try_join_all` will switch to the more powerful [`FuturesOrdered`] for performance
-/// reasons if the number of futures is large. You may want to look into using it or
-/// its counterpart [`FuturesUnordered`][crate::stream::FuturesUnordered] directly.
+/// `try_join_all` will switch to an implementation based on the more powerful
+/// [`FuturesUnordered`][crate::stream::FuturesUnordered] for performance reasons
+/// if the number of futures is large. You may want to look into using it or its
+/// counterpart [`FuturesOrdered`][crate::stream::FuturesOrdered] directly.
 ///
 /// Some examples for additional functionality provided by these are:
 ///
@@ -122,29 +132,19 @@ where
     let iter = iter.into_iter().map(TryFutureExt::into_future);
 
     #[cfg(not(target_has_atomic = "ptr"))]
-    {
-        let kind = TryJoinAllKind::Small {
-            elems: iter.map(TryMaybeDone::Future).collect::<Box<[_]>>().into(),
-        };
-
-        assert_future::<Result<Vec<<I::Item as TryFuture>::Ok>, <I::Item as TryFuture>::Error>, _>(
-            TryJoinAll { kind },
-        )
-    }
+    let kind = TryJoinAllKind::Small {
+        elems: iter.map(TryMaybeDone::Future).collect::<Box<[_]>>().into(),
+    };
 
     #[cfg(target_has_atomic = "ptr")]
-    {
-        let kind = match iter.size_hint().1 {
-            Some(max) if max <= join_all::SMALL => TryJoinAllKind::Small {
-                elems: iter.map(TryMaybeDone::Future).collect::<Box<[_]>>().into(),
-            },
-            _ => TryJoinAllKind::Big { fut: iter.collect::<FuturesOrdered<_>>().try_collect() },
-        };
+    let kind = match join_all::collect_futures(iter, TryMaybeDone::Future) {
+        Collected::Small(elems) => TryJoinAllKind::Small { elems: elems.into() },
+        Collected::Big(fut) => TryJoinAllKind::Big { outputs: join_all::output_slots(&fut), fut },
+    };
 
-        assert_future::<Result<Vec<<I::Item as TryFuture>::Ok>, <I::Item as TryFuture>::Error>, _>(
-            TryJoinAll { kind },
-        )
-    }
+    assert_future::<Result<Vec<<I::Item as TryFuture>::Ok>, <I::Item as TryFuture>::Error>, _>(
+        TryJoinAll { kind },
+    )
 }
 
 impl<F> Future for TryJoinAll<F>
@@ -185,7 +185,29 @@ where
                 }
             }
             #[cfg(target_has_atomic = "ptr")]
-            TryJoinAllKind::Big { fut } => Pin::new(fut).poll(cx),
+            TryJoinAllKind::Big { fut, outputs } => poll_big(fut, outputs, cx),
+        }
+    }
+}
+
+// Not inlined to keep `TryJoinAll::poll` small for the `Small` case.
+#[cfg(target_has_atomic = "ptr")]
+#[inline(never)]
+fn poll_big<F: TryFuture>(
+    fut: &mut FuturesUnordered<OrderWrapper<IntoFuture<F>>>,
+    outputs: &mut Box<[Option<F::Ok>]>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<Vec<F::Ok>, F::Error>> {
+    loop {
+        match ready!(fut.poll_next_unpin(cx)) {
+            Some(OrderWrapper { data: Ok(data), index }) => outputs[index as usize] = Some(data),
+            Some(OrderWrapper { data: Err(e), .. }) => {
+                // Cancel all other futures.
+                fut.clear();
+                *outputs = Box::new([]);
+                return Poll::Ready(Err(e));
+            }
+            None => return Poll::Ready(Ok(join_all::take_outputs(outputs))),
         }
     }
 }

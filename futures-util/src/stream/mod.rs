@@ -100,7 +100,7 @@ pub use self::unfold::{Unfold, unfold};
 
 #[cfg(target_has_atomic = "ptr")]
 #[cfg(feature = "alloc")]
-mod futures_ordered;
+pub(crate) mod futures_ordered;
 #[cfg(target_has_atomic = "ptr")]
 #[cfg(feature = "alloc")]
 pub use self::futures_ordered::FuturesOrdered;
