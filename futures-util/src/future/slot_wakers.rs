@@ -23,7 +23,7 @@ use core::{
     ptr::{self, NonNull},
     sync::atomic::{
         AtomicBool, AtomicPtr,
-        Ordering::{AcqRel, Acquire, Relaxed, Release},
+        Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
@@ -42,6 +42,9 @@ pub(crate) struct SlotWakers {
 struct Inner {
     /// The waker of the task that polls the futures.
     parent: AtomicWaker,
+    /// Whether the task that polls the futures may be waiting for a wake-up,
+    /// in which case enqueueing a slot must wake `parent`.
+    parked: AtomicBool,
     // Producer end of the ready queue.
     // Safety invariant: points to one of the `len + 1` slots at `slots`.
     head: AtomicPtr<Slot>,
@@ -103,6 +106,7 @@ impl SlotWakers {
         let stub = unsafe { slots.add(len) }.as_ptr();
         let inner = Arc::into_raw(Arc::new(Inner {
             parent: AtomicWaker::new(),
+            parked: AtomicBool::new(false),
             head: AtomicPtr::new(stub),
             tail: UnsafeCell::new(stub),
             slots,
@@ -172,14 +176,34 @@ impl SlotWakers {
                     Dequeue::Data(slot) => {
                         (slot.addr() - self.inner.slots.as_ptr().addr()) / mem::size_of::<Slot>()
                     }
-                    Dequeue::Empty if !registered => {
-                        // Register before checking the queue again, as a slot
-                        // could have been enqueued after the check above.
-                        self.inner.parent.register(cx.waker());
-                        registered = true;
-                        continue;
+                    Dequeue::Empty => {
+                        let first = !registered;
+                        if first {
+                            self.inner.parent.register(cx.waker());
+                            registered = true;
+                            // Announce that we may wait for a wake-up.
+                            self.inner.parked.store(true, SeqCst);
+                        }
+                        // Check whether a slot was enqueued after `dequeue`
+                        // looked at the queue. The store of `parked` above, this
+                        // load, the swap of `head` in `enqueue` and the load of
+                        // `parked` after it in `wake_by_ref` are all `SeqCst`. In
+                        // their single total order, either the swap comes before
+                        // this load, which then sees it, or the store of
+                        // `parked` comes before the load of `parked` by the
+                        // waker, which then wakes us (unless another waker
+                        // already cleared `parked` and woke us).
+                        if ptr::eq(self.inner.head.load(SeqCst), self.inner.stub()) {
+                            return Poll::Pending;
+                        }
+                        if first {
+                            continue;
+                        }
+                        // A slot is being enqueued, but the link to it is not
+                        // visible yet, and its waker may not wake us.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
                     }
-                    Dequeue::Empty => return Poll::Pending,
                     Dequeue::Inconsistent => {
                         // A producer is in the middle of enqueueing a slot.
                         cx.waker().wake_by_ref();
@@ -292,7 +316,8 @@ impl Inner {
     unsafe fn enqueue(&self, slot: &Slot) {
         slot.next.store(ptr::null_mut(), Relaxed);
         let slot = ptr::from_ref(slot).cast_mut();
-        let prev = self.head.swap(slot, AcqRel);
+        // `SeqCst` for the handshake with `parked` (see `SlotWakers::poll`).
+        let prev = self.head.swap(slot, SeqCst);
         // SAFETY: `prev` was stored in `head`, which only ever holds pointers to
         // slots of `self` (invariant of `head`, maintained because the caller
         // only passes slots of `self`), and those are alive while `self` is.
@@ -438,7 +463,11 @@ unsafe fn wake_by_ref(data: *const ()) {
         // SAFETY: `slot` is a slot of `inner`. The flag changed from `false`
         // to `true`, so the slot is not in the queue.
         unsafe { inner.enqueue(slot) };
-        inner.parent.wake();
+        // Only wake the parent task if it may be waiting for a wake-up. See
+        // `SlotWakers::poll` for why this does not miss wake-ups.
+        if inner.parked.load(SeqCst) && inner.parked.swap(false, AcqRel) {
+            inner.parent.wake();
+        }
     }
 }
 

@@ -2,7 +2,7 @@ use core::cell::UnsafeCell;
 
 use atomic::{
     AtomicBool, AtomicPtr,
-    Ordering::{self, Relaxed, SeqCst},
+    Ordering::{self, AcqRel, Relaxed, SeqCst},
 };
 
 use super::{Arc, ReadyToRunQueue, Weak, abort::abort, atomic};
@@ -121,7 +121,12 @@ impl<Fut> ArcWake for Task<Fut> {
         let prev = arc_self.queued.swap(true, SeqCst);
         if !prev {
             inner.enqueue(Arc::as_ptr(arc_self));
-            inner.waker.wake();
+            // Only wake the parent task if it may be waiting for a wake-up.
+            // See `FuturesUnordered::poll_next` for why this does not miss
+            // wake-ups.
+            if inner.parked.load(SeqCst) && inner.parked.swap(false, AcqRel) {
+                inner.waker.wake();
+            }
         }
     }
 }

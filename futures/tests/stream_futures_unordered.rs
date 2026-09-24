@@ -664,3 +664,32 @@ fn drop_with_free_tasks() {
     stream.push(future::ready(0));
     drop(stream);
 }
+
+#[test]
+fn cross_thread_wakeups_stress() {
+    // Several threads complete the futures while `block_on` polls and parks,
+    // so wake-ups race with the check for an empty queue.
+    let rounds = if cfg!(miri) { 2 } else { 200 };
+    let n = if cfg!(miri) { 40 } else { 400 };
+    for _ in 0..rounds {
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| oneshot::channel::<usize>()).unzip();
+        let mut txs: Vec<_> = txs.into_iter().enumerate().collect();
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let chunk: Vec<_> = txs.drain(..(n / (4 - t)).min(txs.len())).collect();
+                std::thread::spawn(move || {
+                    for (i, tx) in chunk {
+                        tx.send(i).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let stream = rxs.into_iter().collect::<FuturesUnordered<_>>();
+        let mut values = block_on(stream.map(Result::unwrap).collect::<Vec<_>>());
+        values.sort_unstable();
+        assert_eq!(values, (0..n).collect::<Vec<_>>());
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+}
