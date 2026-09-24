@@ -78,6 +78,9 @@ pub use self::join::{Join, join};
 #[cfg(feature = "alloc")]
 mod join_all;
 #[cfg(feature = "alloc")]
+#[cfg(target_has_atomic = "ptr")]
+mod slot_wakers;
+#[cfg(feature = "alloc")]
 pub use self::join_all::{JoinAll, join_all};
 
 mod select;

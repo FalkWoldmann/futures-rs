@@ -12,14 +12,9 @@ use core::{
 };
 
 #[cfg(target_has_atomic = "ptr")]
-use futures_core::ready;
-
-#[cfg(target_has_atomic = "ptr")]
-use super::join_all::Collected;
+use super::slot_wakers::SlotWakers;
 use super::{IntoFuture, TryFuture, TryMaybeDone, assert_future, join_all};
 use crate::TryFutureExt;
-#[cfg(target_has_atomic = "ptr")]
-use crate::stream::{FuturesUnordered, StreamExt, futures_ordered::OrderWrapper};
 
 enum FinalState<E = ()> {
     Pending,
@@ -33,22 +28,12 @@ pub struct TryJoinAll<F>
 where
     F: TryFuture,
 {
-    kind: TryJoinAllKind<F>,
-}
-
-enum TryJoinAllKind<F>
-where
-    F: TryFuture,
-{
-    Small {
-        elems: Pin<Box<[TryMaybeDone<IntoFuture<F>>]>>,
-    },
+    elems: Pin<Box<[TryMaybeDone<IntoFuture<F>>]>>,
+    // Wakers which record the futures that were woken, so that only those are
+    // polled. `None` if there are at most `join_all::SMALL` futures, which are
+    // all polled whenever `TryJoinAll` is polled.
     #[cfg(target_has_atomic = "ptr")]
-    Big {
-        fut: FuturesUnordered<OrderWrapper<IntoFuture<F>>>,
-        // The output of each future, stored at the future's index.
-        outputs: Box<[Option<F::Ok>]>,
-    },
+    wakers: Option<SlotWakers>,
 }
 
 impl<F> fmt::Debug for TryJoinAll<F>
@@ -59,15 +44,7 @@ where
     F::Output: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            TryJoinAllKind::Small { ref elems } => {
-                f.debug_struct("TryJoinAll").field("elems", elems).finish()
-            }
-            #[cfg(target_has_atomic = "ptr")]
-            TryJoinAllKind::Big { ref fut, ref outputs } => {
-                f.debug_struct("TryJoinAll").field("fut", fut).field("outputs", outputs).finish()
-            }
-        }
+        f.debug_struct("TryJoinAll").field("elems", &self.elems).finish()
     }
 }
 
@@ -83,23 +60,21 @@ where
 /// however, then the returned future will succeed with a `Vec` of all the
 /// successful results.
 ///
+/// When there are many futures, only the ones that have been woken are polled,
+/// like with [`FuturesUnordered`][crate::stream::FuturesUnordered].
+///
 /// This function is only available when the `std` or `alloc` feature of this
 /// library is activated, and it is activated by default.
 ///
 /// # See Also
 ///
-/// `try_join_all` will switch to an implementation based on the more powerful
-/// [`FuturesUnordered`][crate::stream::FuturesUnordered] for performance reasons
-/// if the number of futures is large. You may want to look into using it or its
-/// counterpart [`FuturesOrdered`][crate::stream::FuturesOrdered] directly.
-///
-/// Some examples for additional functionality provided by these are:
+/// [`FuturesOrdered`][crate::stream::FuturesOrdered] and its counterpart
+/// [`FuturesUnordered`][crate::stream::FuturesUnordered] provide additional
+/// functionality, such as:
 ///
 ///  * Adding new futures to the set even after it has been started.
 ///
-///  * Only polling the specific futures that have been woken. In cases where
-///    you have a lot of futures this will result in much more efficient polling.
-///
+///  * Receiving the output of each future as soon as it is available.
 ///
 /// # Examples
 ///
@@ -129,21 +104,14 @@ where
     I: IntoIterator,
     I::Item: TryFuture,
 {
-    let iter = iter.into_iter().map(TryFutureExt::into_future);
-
-    #[cfg(not(target_has_atomic = "ptr"))]
-    let kind = TryJoinAllKind::Small {
-        elems: iter.map(TryMaybeDone::Future).collect::<Box<[_]>>().into(),
-    };
-
-    #[cfg(target_has_atomic = "ptr")]
-    let kind = match join_all::collect_futures(iter, TryMaybeDone::Future) {
-        Collected::Small(elems) => TryJoinAllKind::Small { elems: elems.into() },
-        Collected::Big(fut) => TryJoinAllKind::Big { outputs: join_all::output_slots(&fut), fut },
-    };
-
+    let elems: Box<[_]> =
+        iter.into_iter().map(|f| TryMaybeDone::Future(TryFutureExt::into_future(f))).collect();
     assert_future::<Result<Vec<<I::Item as TryFuture>::Ok>, <I::Item as TryFuture>::Error>, _>(
-        TryJoinAll { kind },
+        TryJoinAll {
+            #[cfg(target_has_atomic = "ptr")]
+            wakers: join_all::slot_wakers(elems.len()),
+            elems: elems.into(),
+        },
     )
 }
 
@@ -154,62 +122,58 @@ where
     type Output = Result<Vec<F::Ok>, F::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.kind {
-            TryJoinAllKind::Small { elems } => {
-                let mut state = FinalState::AllDone;
+        let this = &mut *self;
 
-                for elem in join_all::iter_pin_mut(elems.as_mut()) {
-                    match elem.try_poll(cx) {
-                        Poll::Pending => state = FinalState::Pending,
-                        Poll::Ready(Ok(())) => {}
-                        Poll::Ready(Err(e)) => {
-                            state = FinalState::Error(e);
-                            break;
-                        }
-                    }
+        #[cfg(target_has_atomic = "ptr")]
+        if let Some(wakers) = &mut this.wakers {
+            let res = wakers.poll(
+                this.elems.as_mut(),
+                cx,
+                |elem| matches!(elem, TryMaybeDone::Future(_)),
+                |elem, cx| elem.try_poll(cx),
+            );
+            return match res {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    this.wakers = None;
+                    Poll::Ready(Ok(take_outputs(&mut this.elems)))
                 }
+                Poll::Ready(Err(e)) => {
+                    // Cancel all other futures.
+                    this.wakers = None;
+                    this.elems = Box::pin([]);
+                    Poll::Ready(Err(e))
+                }
+            };
+        }
 
-                match state {
-                    FinalState::Pending => Poll::Pending,
-                    FinalState::AllDone => {
-                        let mut elems = mem::replace(elems, Box::pin([]));
-                        let results = join_all::iter_pin_mut(elems.as_mut())
-                            .map(|e| e.take_output().unwrap())
-                            .collect();
-                        Poll::Ready(Ok(results))
-                    }
-                    FinalState::Error(e) => {
-                        let _ = mem::replace(elems, Box::pin([]));
-                        Poll::Ready(Err(e))
-                    }
+        let mut state = FinalState::AllDone;
+
+        for elem in join_all::iter_pin_mut(this.elems.as_mut()) {
+            match elem.try_poll(cx) {
+                Poll::Pending => state = FinalState::Pending,
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => {
+                    state = FinalState::Error(e);
+                    break;
                 }
             }
-            #[cfg(target_has_atomic = "ptr")]
-            TryJoinAllKind::Big { fut, outputs } => poll_big(fut, outputs, cx),
+        }
+
+        match state {
+            FinalState::Pending => Poll::Pending,
+            FinalState::AllDone => Poll::Ready(Ok(take_outputs(&mut this.elems))),
+            FinalState::Error(e) => {
+                this.elems = Box::pin([]);
+                Poll::Ready(Err(e))
+            }
         }
     }
 }
 
-// Not inlined to keep `TryJoinAll::poll` small for the `Small` case.
-#[cfg(target_has_atomic = "ptr")]
-#[inline(never)]
-fn poll_big<F: TryFuture>(
-    fut: &mut FuturesUnordered<OrderWrapper<IntoFuture<F>>>,
-    outputs: &mut Box<[Option<F::Ok>]>,
-    cx: &mut Context<'_>,
-) -> Poll<Result<Vec<F::Ok>, F::Error>> {
-    loop {
-        match ready!(fut.poll_next_unpin(cx)) {
-            Some(OrderWrapper { data: Ok(data), index }) => outputs[index as usize] = Some(data),
-            Some(OrderWrapper { data: Err(e), .. }) => {
-                // Cancel all other futures.
-                fut.clear();
-                *outputs = Box::new([]);
-                return Poll::Ready(Err(e));
-            }
-            None => return Poll::Ready(Ok(join_all::take_outputs(outputs))),
-        }
-    }
+fn take_outputs<F: TryFuture>(elems: &mut Pin<Box<[TryMaybeDone<IntoFuture<F>>]>>) -> Vec<F::Ok> {
+    let mut elems = mem::replace(elems, Box::pin([]));
+    join_all::iter_pin_mut(elems.as_mut()).map(|e| e.take_output().unwrap()).collect()
 }
 
 impl<F> FromIterator<F> for TryJoinAll<F>

@@ -20,11 +20,11 @@ use crate::stream::{FuturesUnordered, StreamExt};
 pin_project! {
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     #[derive(Debug)]
-    pub(crate) struct OrderWrapper<T> {
+    struct OrderWrapper<T> {
         #[pin]
-        pub(crate) data: T, // A future or a future's output
+        data: T, // A future or a future's output
         // Use i64 for index since isize may overflow in 32-bit targets.
-        pub(crate) index: i64,
+        index: i64,
     }
 }
 

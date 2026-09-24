@@ -2,6 +2,8 @@
 //! to finish.
 
 use alloc::{boxed::Box, vec::Vec};
+#[cfg(target_has_atomic = "ptr")]
+use core::convert::Infallible;
 use core::{
     fmt,
     future::Future,
@@ -12,11 +14,8 @@ use core::{
 };
 
 #[cfg(target_has_atomic = "ptr")]
-use futures_core::ready;
-
+use super::slot_wakers::SlotWakers;
 use super::{MaybeDone, assert_future};
-#[cfg(target_has_atomic = "ptr")]
-use crate::stream::{FuturesUnordered, StreamExt, futures_ordered::OrderWrapper};
 
 pub(crate) fn iter_pin_mut<T>(slice: Pin<&mut [T]>) -> impl Iterator<Item = Pin<&mut T>> {
     // Safety: `std` _could_ make this unsound if it were to decide Pin's
@@ -31,76 +30,23 @@ pub struct JoinAll<F>
 where
     F: Future,
 {
-    kind: JoinAllKind<F>,
+    elems: Pin<Box<[MaybeDone<F>]>>,
+    // Wakers which record the futures that were woken, so that only those are
+    // polled. `None` if there are at most `SMALL` futures, which are all polled
+    // whenever `JoinAll` is polled.
+    #[cfg(target_has_atomic = "ptr")]
+    wakers: Option<SlotWakers>,
 }
 
+/// The largest number of futures that [`JoinAll`] and
+/// [`TryJoinAll`](super::TryJoinAll) poll all at once.
 #[cfg(target_has_atomic = "ptr")]
 pub(crate) const SMALL: usize = 30;
 
-enum JoinAllKind<F>
-where
-    F: Future,
-{
-    Small {
-        elems: Pin<Box<[MaybeDone<F>]>>,
-    },
-    #[cfg(target_has_atomic = "ptr")]
-    Big {
-        fut: FuturesUnordered<OrderWrapper<F>>,
-        // The output of each future, stored at the future's index.
-        outputs: Box<[Option<F::Output>]>,
-    },
-}
-
-/// The futures of a [`JoinAll`] or [`TryJoinAll`](super::TryJoinAll), collected
-/// into the representation that is appropriate for their number.
+/// Returns the wakers for `len` futures if there are more than `SMALL`.
 #[cfg(target_has_atomic = "ptr")]
-pub(crate) enum Collected<W, F> {
-    Small(Box<[W]>),
-    Big(FuturesUnordered<OrderWrapper<F>>),
-}
-
-/// Collects the futures yielded by `iter`, wrapping each of them with `wrap` if
-/// there are at most `SMALL` of them and tagging each of them with its index
-/// otherwise.
-#[cfg(target_has_atomic = "ptr")]
-pub(crate) fn collect_futures<I, W>(
-    mut iter: I,
-    wrap: impl FnMut(I::Item) -> W,
-) -> Collected<W, I::Item>
-where
-    I: Iterator,
-{
-    fn index_all<F>(iter: impl Iterator<Item = F>) -> FuturesUnordered<OrderWrapper<F>> {
-        iter.enumerate().map(|(i, data)| OrderWrapper { data, index: i as i64 }).collect()
-    }
-
-    match iter.size_hint() {
-        (_, Some(max)) if max <= SMALL => Collected::Small(iter.map(wrap).collect()),
-        (min, _) if min > SMALL => Collected::Big(index_all(iter)),
-        _ => {
-            // The size hint is inconclusive, so buffer up to `SMALL + 1`
-            // futures to find out whether there are more than `SMALL`.
-            let head: Vec<_> = iter.by_ref().take(SMALL + 1).collect();
-            if head.len() <= SMALL {
-                Collected::Small(head.into_iter().map(wrap).collect())
-            } else {
-                Collected::Big(index_all(head.into_iter().chain(iter)))
-            }
-        }
-    }
-}
-
-/// Allocates a slot for the output of each of the given futures.
-#[cfg(target_has_atomic = "ptr")]
-pub(crate) fn output_slots<F, T>(fut: &FuturesUnordered<F>) -> Box<[Option<T>]> {
-    core::iter::repeat_with(|| None).take(fut.len()).collect()
-}
-
-/// Unwraps the outputs of all futures once they have completed.
-#[cfg(target_has_atomic = "ptr")]
-pub(crate) fn take_outputs<T>(outputs: &mut Box<[Option<T>]>) -> Vec<T> {
-    mem::take(outputs).into_vec().into_iter().map(|output| output.unwrap()).collect()
+pub(crate) fn slot_wakers(len: usize) -> Option<SlotWakers> {
+    (len > SMALL).then(|| SlotWakers::new(len))
 }
 
 impl<F> fmt::Debug for JoinAll<F>
@@ -109,15 +55,7 @@ where
     F::Output: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            JoinAllKind::Small { ref elems } => {
-                f.debug_struct("JoinAll").field("elems", elems).finish()
-            }
-            #[cfg(target_has_atomic = "ptr")]
-            JoinAllKind::Big { ref fut, ref outputs } => {
-                f.debug_struct("JoinAll").field("fut", fut).field("outputs", outputs).finish()
-            }
-        }
+        f.debug_struct("JoinAll").field("elems", &self.elems).finish()
     }
 }
 
@@ -128,22 +66,21 @@ where
 /// collecting the results into a destination `Vec<T>` in the same order as they
 /// were provided.
 ///
+/// When there are many futures, only the ones that have been woken are polled,
+/// like with [`FuturesUnordered`][crate::stream::FuturesUnordered].
+///
 /// This function is only available when the `std` or `alloc` feature of this
 /// library is activated, and it is activated by default.
 ///
 /// # See Also
 ///
-/// `join_all` will switch to an implementation based on the more powerful
-/// [`FuturesUnordered`][crate::stream::FuturesUnordered] for performance reasons
-/// if the number of futures is large. You may want to look into using it or its
-/// counterpart [`FuturesOrdered`][crate::stream::FuturesOrdered] directly.
-///
-/// Some examples for additional functionality provided by these are:
+/// [`FuturesOrdered`][crate::stream::FuturesOrdered] and its counterpart
+/// [`FuturesUnordered`][crate::stream::FuturesUnordered] provide additional
+/// functionality, such as:
 ///
 ///  * Adding new futures to the set even after it has been started.
 ///
-///  * Only polling the specific futures that have been woken. In cases where
-///    you have a lot of futures this will result in much more efficient polling.
+///  * Receiving the output of each future as soon as it is available.
 ///
 /// # Examples
 ///
@@ -163,19 +100,12 @@ where
     I: IntoIterator,
     I::Item: Future,
 {
-    let iter = iter.into_iter();
-
-    #[cfg(not(target_has_atomic = "ptr"))]
-    let kind =
-        JoinAllKind::Small { elems: iter.map(MaybeDone::Future).collect::<Box<[_]>>().into() };
-
-    #[cfg(target_has_atomic = "ptr")]
-    let kind = match collect_futures(iter, MaybeDone::Future) {
-        Collected::Small(elems) => JoinAllKind::Small { elems: elems.into() },
-        Collected::Big(fut) => JoinAllKind::Big { outputs: output_slots(&fut), fut },
-    };
-
-    assert_future::<Vec<<I::Item as Future>::Output>, _>(JoinAll { kind })
+    let elems: Box<[_]> = iter.into_iter().map(MaybeDone::Future).collect();
+    assert_future::<Vec<<I::Item as Future>::Output>, _>(JoinAll {
+        #[cfg(target_has_atomic = "ptr")]
+        wakers: slot_wakers(elems.len()),
+        elems: elems.into(),
+    })
 }
 
 impl<F> Future for JoinAll<F>
@@ -185,45 +115,40 @@ where
     type Output = Vec<F::Output>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.kind {
-            JoinAllKind::Small { elems } => {
-                let mut all_done = true;
+        let this = &mut *self;
 
-                for elem in iter_pin_mut(elems.as_mut()) {
-                    if elem.poll(cx).is_pending() {
-                        all_done = false;
-                    }
+        #[cfg(target_has_atomic = "ptr")]
+        if let Some(wakers) = &mut this.wakers {
+            let res = wakers.poll(
+                this.elems.as_mut(),
+                cx,
+                |elem| matches!(elem, MaybeDone::Future(_)),
+                |elem, cx| elem.poll(cx).map(Ok::<_, Infallible>),
+            );
+            return match res {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => {
+                    this.wakers = None;
+                    Poll::Ready(take_outputs(&mut this.elems))
                 }
-
-                if all_done {
-                    let mut elems = mem::replace(elems, Box::pin([]));
-                    let result =
-                        iter_pin_mut(elems.as_mut()).map(|e| e.take_output().unwrap()).collect();
-                    Poll::Ready(result)
-                } else {
-                    Poll::Pending
-                }
-            }
-            #[cfg(target_has_atomic = "ptr")]
-            JoinAllKind::Big { fut, outputs } => poll_big(fut, outputs, cx),
+            };
         }
+
+        let mut all_done = true;
+
+        for elem in iter_pin_mut(this.elems.as_mut()) {
+            if elem.poll(cx).is_pending() {
+                all_done = false;
+            }
+        }
+
+        if all_done { Poll::Ready(take_outputs(&mut this.elems)) } else { Poll::Pending }
     }
 }
 
-// Not inlined to keep `JoinAll::poll` small for the `Small` case.
-#[cfg(target_has_atomic = "ptr")]
-#[inline(never)]
-fn poll_big<F: Future>(
-    fut: &mut FuturesUnordered<OrderWrapper<F>>,
-    outputs: &mut Box<[Option<F::Output>]>,
-    cx: &mut Context<'_>,
-) -> Poll<Vec<F::Output>> {
-    loop {
-        match ready!(fut.poll_next_unpin(cx)) {
-            Some(OrderWrapper { data, index }) => outputs[index as usize] = Some(data),
-            None => return Poll::Ready(take_outputs(outputs)),
-        }
-    }
+fn take_outputs<F: Future>(elems: &mut Pin<Box<[MaybeDone<F>]>>) -> Vec<F::Output> {
+    let mut elems = mem::replace(elems, Box::pin([]));
+    iter_pin_mut(elems.as_mut()).map(|e| e.take_output().unwrap()).collect()
 }
 
 impl<F: Future> FromIterator<F> for JoinAll<F> {
