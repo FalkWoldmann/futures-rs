@@ -693,3 +693,37 @@ fn cross_thread_wakeups_stress() {
         }
     }
 }
+
+#[test]
+fn wake_after_drop_releases_task() {
+    use std::{
+        sync::{Arc, Mutex},
+        task::Waker,
+    };
+
+    // Futures that keep a clone of their waker and stay pending.
+    let wakers = Arc::new(Mutex::new(Vec::<Waker>::new()));
+    let mut stream = FuturesUnordered::new();
+    for _ in 0..4 {
+        let wakers = wakers.clone();
+        stream.push(future::poll_fn(move |cx| {
+            wakers.lock().unwrap().push(cx.waker().clone());
+            Poll::<()>::Pending
+        }));
+    }
+    assert_stream_pending!(stream);
+    // Wake one of them so that it is enqueued when the set is dropped.
+    wakers.lock().unwrap()[0].wake_by_ref();
+    drop(stream);
+
+    // Waking after the set was dropped must release the tasks (Miri checks for
+    // leaks), both for tasks that were pending and for the enqueued one.
+    let wakers = std::mem::take(&mut *wakers.lock().unwrap());
+    for (i, waker) in wakers.into_iter().enumerate() {
+        if i % 2 == 0 {
+            waker.wake_by_ref();
+        } else {
+            waker.wake();
+        }
+    }
+}

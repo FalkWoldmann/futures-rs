@@ -99,16 +99,13 @@ unsafe impl<Fut> Sync for Task<Fut> {}
 
 impl<Fut> ArcWake for Task<Fut> {
     fn wake_by_ref(arc_self: &Arc<Self>) {
-        let inner = match arc_self.ready_to_run_queue.upgrade() {
-            Some(inner) => inner,
-            None => return,
-        };
-
         arc_self.woken.store(true, Relaxed);
 
         // It's our job to enqueue this task it into the ready to run queue. To
         // do this we set the `queued` flag, and if successful we then do the
         // actual queueing operation, ensuring that we're only queued once.
+        // If the flag was already set, the task is already enqueued or has been
+        // released, and there is nothing to do.
         //
         // Once the task is inserted call `wake` to notify the parent task,
         // as it'll want to come along and run our task later.
@@ -118,15 +115,35 @@ impl<Fut> ArcWake for Task<Fut> {
         // implementation guarantees that if we set the `queued` flag that
         // there's a reference count held by the main `FuturesUnordered` queue
         // still.
-        let prev = arc_self.queued.swap(true, SeqCst);
-        if !prev {
-            inner.enqueue(Arc::as_ptr(arc_self));
-            // Only wake the parent task if it may be waiting for a wake-up.
-            // See `FuturesUnordered::poll_next` for why this does not miss
-            // wake-ups.
-            if inner.parked.load(SeqCst) && inner.parked.swap(false, AcqRel) {
-                inner.waker.wake();
+        if arc_self.queued.swap(true, SeqCst) {
+            return;
+        }
+
+        let inner = match arc_self.ready_to_run_queue.upgrade() {
+            Some(inner) => inner,
+            None => {
+                // The `FuturesUnordered` was dropped. The task was linked into
+                // its list of all futures when we set the `queued` flag (a
+                // task that is not linked has the flag set), so the
+                // `FuturesUnordered` released it afterwards, saw the flag set
+                // and transferred its reference count to whoever enqueues the
+                // task, which is us. We won't enqueue it, so release the
+                // reference count.
+                //
+                // SAFETY: `arc_self` points to a task whose reference count was
+                // transferred to us as explained above, and `arc_self` itself
+                // holds another one, so this doesn't free the task while
+                // `arc_self` is in use.
+                drop(unsafe { Arc::from_raw(Arc::as_ptr(arc_self)) });
+                return;
             }
+        };
+
+        inner.enqueue(Arc::as_ptr(arc_self));
+        // Only wake the parent task if it may be waiting for a wake-up. See
+        // `FuturesUnordered::poll_next` for why this does not miss wake-ups.
+        if inner.parked.load(SeqCst) && inner.parked.swap(false, AcqRel) {
+            inner.waker.wake();
         }
     }
 }
