@@ -142,6 +142,9 @@ impl SlotWakers {
     /// # Panics
     ///
     /// Panics if `elems` does not have the length given to `new`.
+    // Not inlined, so that the callers stay small enough for the polling of a
+    // small number of futures to be inlined into them.
+    #[inline(never)]
     pub(crate) fn poll<T, E>(
         &mut self,
         mut elems: Pin<&mut [T]>,

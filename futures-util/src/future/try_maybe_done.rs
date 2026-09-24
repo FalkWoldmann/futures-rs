@@ -76,6 +76,7 @@ impl<Fut: TryFuture> FusedFuture for TryMaybeDone<Fut> {
 impl<Fut: TryFuture> Future for TryMaybeDone<Fut> {
     type Output = Result<(), Fut::Error>;
 
+    #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         unsafe {
             match self.as_mut().get_unchecked_mut() {

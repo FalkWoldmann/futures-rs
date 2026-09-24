@@ -92,6 +92,7 @@ impl<Fut: Future> FusedFuture for MaybeDone<Fut> {
 impl<Fut: Future> Future for MaybeDone<Fut> {
     type Output = ();
 
+    #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         unsafe {
             match self.as_mut().get_unchecked_mut() {
