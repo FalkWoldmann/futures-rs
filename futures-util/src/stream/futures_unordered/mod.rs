@@ -144,6 +144,7 @@ impl<Fut> FuturesUnordered<Fut> {
         let stub_ptr = Arc::as_ptr(&stub);
         let ready_to_run_queue = Arc::new(ReadyToRunQueue {
             waker: AtomicWaker::new(),
+            parked: AtomicBool::new(false),
             head: AtomicPtr::new(stub_ptr as *mut _),
             tail: UnsafeCell::new(stub_ptr),
             stub,
@@ -434,16 +435,36 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
                         // have yielded a `None`
                         *self.is_terminated.get_mut() = true;
                         return Poll::Ready(None);
-                    } else if !registered {
-                        // Ensure `parent` is correctly set, then check the
-                        // queue again, as a task could have been enqueued
-                        // after the previous `dequeue` but before `register`.
+                    }
+
+                    let first = !registered;
+                    if first {
+                        // Ensure `parent` is correctly set, and announce that
+                        // we may wait for a wake-up.
                         self.ready_to_run_queue.waker.register(cx.waker());
                         registered = true;
-                        continue;
-                    } else {
+                        self.ready_to_run_queue.parked.store(true, SeqCst);
+                    }
+                    // Check whether a task was enqueued after `dequeue` looked
+                    // at the queue. The store of `parked` above, this load, the
+                    // swap of `head` in `enqueue` and the load of `parked` after
+                    // it in `wake_by_ref` are all `SeqCst`. In their single
+                    // total order, either the swap comes before this load,
+                    // which then sees it, or the store of `parked` comes before
+                    // the load of `parked` by the waker, which then wakes us
+                    // (unless another waker already cleared `parked` and woke
+                    // us).
+                    let queue = &self.ready_to_run_queue;
+                    if ptr::eq(queue.head.load(SeqCst), queue.stub()) {
                         return Poll::Pending;
                     }
+                    if first {
+                        continue;
+                    }
+                    // A task is being enqueued, but the link to it is not
+                    // visible yet, and its waker may not wake us.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
                 Dequeue::Inconsistent => {
                     // At this point, it may be worth yielding the thread &

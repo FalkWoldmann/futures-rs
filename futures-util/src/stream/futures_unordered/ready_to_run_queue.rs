@@ -4,8 +4,8 @@ use super::{
     Arc,
     abort::abort,
     atomic::{
-        AtomicPtr,
-        Ordering::{AcqRel, Acquire, Relaxed, Release},
+        AtomicBool, AtomicPtr,
+        Ordering::{Acquire, Relaxed, Release, SeqCst},
     },
     task::Task,
 };
@@ -20,6 +20,10 @@ pub(super) enum Dequeue<Fut> {
 pub(super) struct ReadyToRunQueue<Fut> {
     // The waker of the task using `FuturesUnordered`.
     pub(super) waker: AtomicWaker,
+
+    // Whether the task using `FuturesUnordered` may be waiting for a wake-up,
+    // in which case enqueueing a woken task must wake `waker`.
+    pub(super) parked: AtomicBool,
 
     // Head/tail of the readiness queue
     pub(super) head: AtomicPtr<Task<Fut>>,
@@ -42,7 +46,8 @@ impl<Fut> ReadyToRunQueue<Fut> {
 
             // Note that these atomic orderings come from 1024cores
             let task = task as *mut _;
-            let prev = self.head.swap(task, AcqRel);
+            // `SeqCst` for the handshake with `parked` (see `poll_next`).
+            let prev = self.head.swap(task, SeqCst);
             (*prev).next_ready_to_run.store(task, Release);
         }
     }

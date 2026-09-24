@@ -557,3 +557,97 @@ fn panic_on_poll_releases_task() {
     assert_eq!(stream.len(), 1);
     assert_stream_pending!(stream);
 }
+
+#[test]
+fn concurrent_push() {
+    let mut stream = FuturesUnordered::new();
+    for round in 0..20 {
+        // Complete some futures first.
+        for i in 0..16 {
+            stream.push(future::ready(i));
+        }
+        assert_eq!(block_on(stream.by_ref().collect::<Vec<_>>()).len(), 16);
+
+        // Push from several threads concurrently.
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let stream = &stream;
+                s.spawn(move || {
+                    for i in 0..8 {
+                        stream.push(future::ready(round * 100 + t * 10 + i));
+                    }
+                });
+            }
+        });
+        assert_eq!(stream.len(), 32);
+        let mut values = block_on(stream.by_ref().collect::<Vec<_>>());
+        values.sort_unstable();
+        let mut expected: Vec<_> =
+            (0..4).flat_map(|t| (0..8).map(move |i| round * 100 + t * 10 + i)).collect();
+        expected.sort_unstable();
+        assert_eq!(values, expected);
+    }
+}
+
+#[test]
+fn cross_thread_wakeups_stress() {
+    // Several threads complete the futures while `block_on` polls and parks,
+    // so wake-ups race with the check for an empty queue.
+    let rounds = if cfg!(miri) { 2 } else { 200 };
+    let n = if cfg!(miri) { 40 } else { 400 };
+    for _ in 0..rounds {
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..n).map(|_| oneshot::channel::<usize>()).unzip();
+        let mut txs: Vec<_> = txs.into_iter().enumerate().collect();
+        let handles: Vec<_> = (0..4)
+            .map(|t| {
+                let chunk: Vec<_> = txs.drain(..(n / (4 - t)).min(txs.len())).collect();
+                std::thread::spawn(move || {
+                    for (i, tx) in chunk {
+                        tx.send(i).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let stream = rxs.into_iter().collect::<FuturesUnordered<_>>();
+        let mut values = block_on(stream.map(Result::unwrap).collect::<Vec<_>>());
+        values.sort_unstable();
+        assert_eq!(values, (0..n).collect::<Vec<_>>());
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn wake_after_drop_releases_task() {
+    use std::{
+        sync::{Arc, Mutex},
+        task::Waker,
+    };
+
+    // Futures that keep a clone of their waker and stay pending.
+    let wakers = Arc::new(Mutex::new(Vec::<Waker>::new()));
+    let mut stream = FuturesUnordered::new();
+    for _ in 0..4 {
+        let wakers = wakers.clone();
+        stream.push(future::poll_fn(move |cx| {
+            wakers.lock().unwrap().push(cx.waker().clone());
+            Poll::<()>::Pending
+        }));
+    }
+    assert_stream_pending!(stream);
+    // Wake one of them so that it is enqueued when the set is dropped.
+    wakers.lock().unwrap()[0].wake_by_ref();
+    drop(stream);
+
+    // Waking after the set was dropped must release the tasks (Miri checks for
+    // leaks), both for tasks that were pending and for the enqueued one.
+    let wakers = std::mem::take(&mut *wakers.lock().unwrap());
+    for (i, waker) in wakers.into_iter().enumerate() {
+        if i % 2 == 0 {
+            waker.wake_by_ref();
+        } else {
+            waker.wake();
+        }
+    }
+}
