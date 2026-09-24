@@ -11,10 +11,10 @@ use core::{
     task::{Context, Poll},
 };
 
+#[cfg(target_has_atomic = "ptr")]
+use super::wake_groups::WakeGroups;
 use super::{IntoFuture, TryFuture, TryMaybeDone, assert_future, join_all};
 use crate::TryFutureExt;
-#[cfg(target_has_atomic = "ptr")]
-use crate::stream::{FuturesOrdered, TryCollect, TryStreamExt};
 
 enum FinalState<E = ()> {
     Pending,
@@ -40,7 +40,7 @@ where
     },
     #[cfg(target_has_atomic = "ptr")]
     Big {
-        fut: TryCollect<FuturesOrdered<IntoFuture<F>>, Vec<F::Ok>>,
+        groups: WakeGroups<TryMaybeDone<IntoFuture<F>>>,
     },
 }
 
@@ -57,7 +57,9 @@ where
                 f.debug_struct("TryJoinAll").field("elems", elems).finish()
             }
             #[cfg(target_has_atomic = "ptr")]
-            TryJoinAllKind::Big { ref fut, .. } => fmt::Debug::fmt(fut, f),
+            TryJoinAllKind::Big { ref groups } => {
+                f.debug_struct("TryJoinAll").field("elems", groups).finish()
+            }
         }
     }
 }
@@ -74,21 +76,21 @@ where
 /// however, then the returned future will succeed with a `Vec` of all the
 /// successful results.
 ///
+/// If there are many futures, a wake-up only causes the futures near the woken
+/// one to be polled, like with [`FuturesUnordered`][crate::stream::FuturesUnordered].
+///
 /// This function is only available when the `std` or `alloc` feature of this
 /// library is activated, and it is activated by default.
 ///
 /// # See Also
 ///
-/// `try_join_all` will switch to the more powerful [`FuturesOrdered`] for performance
-/// reasons if the number of futures is large. You may want to look into using it or
-/// its counterpart [`FuturesUnordered`][crate::stream::FuturesUnordered] directly.
-///
-/// Some examples for additional functionality provided by these are:
+/// [`FuturesOrdered`][crate::stream::FuturesOrdered] and its counterpart
+/// [`FuturesUnordered`][crate::stream::FuturesUnordered] provide additional
+/// functionality, such as:
 ///
 ///  * Adding new futures to the set even after it has been started.
 ///
-///  * Only polling the specific futures that have been woken. In cases where
-///    you have a lot of futures this will result in much more efficient polling.
+///  * Receiving the output of each future as soon as it is available.
 ///
 ///
 /// # Examples
@@ -134,11 +136,9 @@ where
 
     #[cfg(target_has_atomic = "ptr")]
     {
-        let kind = match iter.size_hint().1 {
-            Some(max) if max <= join_all::SMALL => TryJoinAllKind::Small {
-                elems: iter.map(TryMaybeDone::Future).collect::<Box<[_]>>().into(),
-            },
-            _ => TryJoinAllKind::Big { fut: iter.collect::<FuturesOrdered<_>>().try_collect() },
+        let kind = match join_all::collect(iter.map(TryMaybeDone::Future)) {
+            Ok(elems) => TryJoinAllKind::Small { elems: elems.into() },
+            Err(groups) => TryJoinAllKind::Big { groups },
         };
 
         assert_future::<Result<Vec<<I::Item as TryFuture>::Ok>, <I::Item as TryFuture>::Error>, _>(
@@ -185,7 +185,23 @@ where
                 }
             }
             #[cfg(target_has_atomic = "ptr")]
-            TryJoinAllKind::Big { fut } => Pin::new(fut).poll(cx),
+            TryJoinAllKind::Big { groups } => {
+                let res = groups.poll(
+                    cx,
+                    |elem| matches!(elem, TryMaybeDone::Future(_)),
+                    |elem, cx| elem.try_poll(cx),
+                );
+                let res = match res {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(())) => {
+                        Ok(groups.iter_pin_mut().map(|e| e.take_output().unwrap()).collect())
+                    }
+                    Poll::Ready(Err(e)) => Err(e),
+                };
+                // Also cancels the other futures if there was an error.
+                self.kind = TryJoinAllKind::Small { elems: Box::pin([]) };
+                Poll::Ready(res)
+            }
         }
     }
 }

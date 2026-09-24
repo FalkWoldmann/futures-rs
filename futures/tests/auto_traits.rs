@@ -336,7 +336,7 @@ mod future {
     assert_not_impl!(JoinAll<SendFuture>: Send);
     assert_impl!(JoinAll<SendSyncFuture<()>>: Sync);
     assert_not_impl!(JoinAll<SendFuture<()>>: Sync);
-    assert_not_impl!(JoinAll<SyncFuture<()>>: Sync);
+    assert_impl!(JoinAll<SyncFuture<()>>: Sync);
     assert_not_impl!(JoinAll<SendSyncFuture>: Sync);
     assert_impl!(JoinAll<PinnedFuture>: Unpin);
 
@@ -551,7 +551,7 @@ mod future {
     assert_not_impl!(TryJoinAll<SendTryFuture>: Send);
     assert_impl!(TryJoinAll<SendSyncTryFuture<(), ()>>: Sync);
     assert_not_impl!(TryJoinAll<SendTryFuture<(), ()>>: Sync);
-    assert_not_impl!(TryJoinAll<SyncTryFuture<(), ()>>: Sync);
+    assert_impl!(TryJoinAll<SyncTryFuture<(), ()>>: Sync);
     assert_not_impl!(TryJoinAll<SendSyncTryFuture>: Sync);
     assert_impl!(TryJoinAll<PinnedTryFuture>: Unpin);
 
