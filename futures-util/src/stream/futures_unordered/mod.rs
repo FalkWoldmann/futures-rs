@@ -419,8 +419,10 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
         let mut polled = 0;
         let mut yielded = 0;
 
-        // Ensure `parent` is correctly set.
-        self.ready_to_run_queue.waker.register(cx.waker());
+        // Whether `parent` has been set to the current waker. It only needs to
+        // be set before returning `Pending` without waking the current task,
+        // which is when the ready to run queue is empty.
+        let mut registered = false;
 
         loop {
             // Safety: &mut self guarantees the mutual exclusion `dequeue`
@@ -432,6 +434,13 @@ impl<Fut: Future> Stream for FuturesUnordered<Fut> {
                         // have yielded a `None`
                         *self.is_terminated.get_mut() = true;
                         return Poll::Ready(None);
+                    } else if !registered {
+                        // Ensure `parent` is correctly set, then check the
+                        // queue again, as a task could have been enqueued
+                        // after the previous `dequeue` but before `register`.
+                        self.ready_to_run_queue.waker.register(cx.waker());
+                        registered = true;
+                        continue;
                     } else {
                         return Poll::Pending;
                     }
