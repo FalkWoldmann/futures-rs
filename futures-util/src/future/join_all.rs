@@ -10,6 +10,7 @@ use core::{
     iter::FromIterator,
     mem,
     pin::Pin,
+    slice::SliceIndex,
     task::{Context, Poll},
 };
 
@@ -17,11 +18,21 @@ use core::{
 use super::wake_groups::WakeGroups;
 use super::{MaybeDone, assert_future};
 
-pub(crate) fn iter_pin_mut<T>(slice: Pin<&mut [T]>) -> impl Iterator<Item = Pin<&mut T>> {
+/// Returns an iterator over the elements of `slice` in `range`.
+///
+/// # Panics
+///
+/// Panics if `range` is out of bounds of `slice`.
+pub(crate) fn iter_pin_mut<T>(
+    slice: Pin<&mut [T]>,
+    range: impl SliceIndex<[T], Output = [T]>,
+) -> impl Iterator<Item = Pin<&mut T>> {
     // Safety: `std` _could_ make this unsound if it were to decide Pin's
     // invariants aren't required to transmit through slices. Otherwise this has
-    // the same safety as a normal field pin projection.
-    unsafe { slice.get_unchecked_mut() }.iter_mut().map(|t| unsafe { Pin::new_unchecked(t) })
+    // the same safety as a normal field pin projection. Taking a sub-slice
+    // doesn't move any element.
+    let slice = unsafe { slice.get_unchecked_mut() };
+    slice[range].iter_mut().map(|t| unsafe { Pin::new_unchecked(t) })
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -160,7 +171,7 @@ where
             JoinAllKind::Small { elems } => {
                 let mut all_done = true;
 
-                for elem in iter_pin_mut(elems.as_mut()) {
+                for elem in iter_pin_mut(elems.as_mut(), ..) {
                     if elem.poll(cx).is_pending() {
                         all_done = false;
                     }
@@ -168,8 +179,9 @@ where
 
                 if all_done {
                     let mut elems = mem::replace(elems, Box::pin([]));
-                    let result =
-                        iter_pin_mut(elems.as_mut()).map(|e| e.take_output().unwrap()).collect();
+                    let result = iter_pin_mut(elems.as_mut(), ..)
+                        .map(|e| e.take_output().unwrap())
+                        .collect();
                     Poll::Ready(result)
                 } else {
                     Poll::Pending

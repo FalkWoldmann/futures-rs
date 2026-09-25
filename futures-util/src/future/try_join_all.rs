@@ -158,7 +158,7 @@ where
             TryJoinAllKind::Small { elems } => {
                 let mut state = FinalState::AllDone;
 
-                for elem in join_all::iter_pin_mut(elems.as_mut()) {
+                for elem in join_all::iter_pin_mut(elems.as_mut(), ..) {
                     match elem.try_poll(cx) {
                         Poll::Pending => state = FinalState::Pending,
                         Poll::Ready(Ok(())) => {}
@@ -173,7 +173,7 @@ where
                     FinalState::Pending => Poll::Pending,
                     FinalState::AllDone => {
                         let mut elems = mem::replace(elems, Box::pin([]));
-                        let results = join_all::iter_pin_mut(elems.as_mut())
+                        let results = join_all::iter_pin_mut(elems.as_mut(), ..)
                             .map(|e| e.take_output().unwrap())
                             .collect();
                         Poll::Ready(Ok(results))

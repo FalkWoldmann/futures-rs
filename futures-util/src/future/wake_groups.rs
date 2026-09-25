@@ -3,9 +3,9 @@
 //! [`JoinAll`](super::JoinAll) and [`TryJoinAll`](super::TryJoinAll) use this
 //! when they are given many futures. The futures are split into groups of
 //! `GROUP_SIZE`, and each group gets a waker, so that a wake-up only causes the
-//! futures in the woken group to be polled. This needs two allocations per
-//! group, instead of a task per future as with
-//! [`FuturesUnordered`](crate::stream::FuturesUnordered).
+//! futures in the woken group to be polled. The futures are stored in one
+//! boxed slice, and each group's waker needs one allocation, instead of a task
+//! per future as with [`FuturesUnordered`](crate::stream::FuturesUnordered).
 //!
 //! The woken groups are recorded in a [`ReadySet`], a tree of atomic bit sets
 //! that wakers can update without locks and without allocating.
@@ -31,7 +31,9 @@ const BITS: usize = usize::BITS as usize;
 
 /// Futures split into groups, each with its own waker.
 pub(crate) struct WakeGroups<T> {
-    groups: Box<[Pin<Box<[T]>>]>,
+    /// The elements; group `i` is `elems[i * GROUP_SIZE..][..GROUP_SIZE]`.
+    elems: Pin<Box<[T]>>,
+    /// One waker per group.
     wakers: Box<[Waker]>,
     shared: Arc<Shared>,
     /// The groups to poll, and the position of the next one in it.
@@ -77,32 +79,27 @@ impl Wake for GroupWaker {
 impl<T> WakeGroups<T> {
     /// Splits the elements yielded by `iter` into groups.
     pub(crate) fn new(iter: impl Iterator<Item = T>) -> Self {
-        let mut iter = iter.peekable();
-        let mut groups = Vec::new();
-        let mut remaining = 0;
-        while iter.peek().is_some() {
-            let group: Box<[T]> = iter.by_ref().take(GROUP_SIZE).collect();
-            remaining += group.len();
-            groups.push(Box::into_pin(group));
-        }
+        let elems: Box<[T]> = iter.collect();
+        let remaining = elems.len();
+        let groups = (remaining + GROUP_SIZE - 1) / GROUP_SIZE;
 
         let shared = Arc::new(Shared {
             parent: AtomicWaker::new(),
             parked: AtomicBool::new(false),
-            ready: ReadySet::new(groups.len()),
+            ready: ReadySet::new(groups),
         });
-        let wakers = (0..groups.len())
+        let wakers = (0..groups)
             .map(|group| Waker::from(Arc::new(GroupWaker { shared: shared.clone(), group })))
             .collect();
         // Every group is polled once before waiting for wake-ups.
-        let queue = (0..groups.len()).collect();
+        let queue = (0..groups).collect();
 
-        Self { groups: groups.into(), wakers, shared, queue, next: 0, remaining }
+        Self { elems: elems.into(), wakers, shared, queue, next: 0, remaining }
     }
 
     /// Returns an iterator over the elements.
     pub(crate) fn iter_pin_mut(&mut self) -> impl Iterator<Item = Pin<&mut T>> {
-        self.groups.iter_mut().flat_map(|group| iter_pin_mut(group.as_mut()))
+        iter_pin_mut(self.elems.as_mut(), ..)
     }
 
     /// Polls the elements in the groups that may be able to make progress.
@@ -125,7 +122,7 @@ impl<T> WakeGroups<T> {
             return Poll::Ready(Ok(()));
         }
 
-        let limit = self.groups.len();
+        let limit = self.wakers.len();
         let mut polled = 0;
         let mut yielded = 0;
         let mut registered = false;
@@ -164,7 +161,9 @@ impl<T> WakeGroups<T> {
             self.next += 1;
 
             let mut group_cx = Context::from_waker(&self.wakers[group]);
-            for elem in iter_pin_mut(self.groups[group].as_mut()) {
+            let start = group * GROUP_SIZE;
+            let end = (start + GROUP_SIZE).min(self.elems.len());
+            for elem in iter_pin_mut(self.elems.as_mut(), start..end) {
                 if !is_pending(elem.as_ref().get_ref()) {
                     continue;
                 }
@@ -280,6 +279,6 @@ impl ReadySet {
 
 impl<T: fmt::Debug> fmt::Debug for WakeGroups<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.groups.iter().flat_map(|group| group.iter())).finish()
+        f.debug_list().entries(self.elems.iter()).finish()
     }
 }
